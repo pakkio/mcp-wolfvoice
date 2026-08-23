@@ -125,6 +125,72 @@ is the landowner's setting. Also note that a running region holds land data in m
 and will overwrite a database edit on its next save, so change it in-world or before
 a restart.
 
+## 4. Required: the `ChatSessionRequest` capability
+
+**Enabling WebRTC voice on a region can break plain TEXT instant messaging** for every
+Firestorm/LL-derived viewer, unless the addon serves the `ChatSessionRequest` capability.
+Current `os-webrtc-janus` does serve it. Older builds do not — if yours predates it, you
+will hit this, and the symptom does not look like a voice problem at all:
+
+> Unable to start a new chat session with <Name>.
+> The session initialization is timed out
+
+Why a *voice* setting breaks *text*:
+
+1. With WebRTC selected, the viewer asks its voice module for a P2P outgoing-call
+   interface. WebRTC deliberately has none — `llvoicewebrtc.h`
+   `getOutgoingCallInterface() override { return nullptr; }`. Only Vivox implements it.
+   LL's own comment in `llimview.cpp` says why: *"webrtc uses the multiagent chat
+   mechanism for p2p calls, instead of relying on vivox calling."*
+2. Because that returns null, `LLIMSession`'s constructor flags **every** new P2P
+   session as "P2P as ad-hoc call" — including an ordinary text IM.
+3. So `sendStartSession` routes the text IM through `ChatSessionRequest` and arms a 30s
+   timer (`SESSION_INITIALIZATION_TIMEOUT`).
+4. Until that session is initialised the viewer does **not** send typed messages. It
+   queues them (`fsfloaterim.cpp` -> `mQueuedMsgsForInit`) and flushes only on the
+   reply. There is no timeout flush and no retry, so with no reply the user's messages
+   are **silently discarded**.
+
+The reply must go out on the agent's **event queue**, not in the HTTP response — the
+viewer inspects only the HTTP status of `start p2p voice` and ignores the body. So this
+cannot be served by an external process: `EventQueueGetModule` holds per-agent in-memory
+queues and exposes no external enqueue endpoint. It has to be in-region code calling
+`IEventQueue.ChatterBoxSessionStartReply(...)`.
+
+Note this is **not** gated by `Cap_ChatSessionRequest` in `[ClientStack.LindenCaps]`.
+Each module reads its own `Cap_*` setting and self-enables; this one does not consult it,
+so leaving that value empty is fine.
+
+### If you are on an older addon build
+
+**Update the addon** — this is fixed upstream in
+[os-webrtc-janus](https://github.com/Misterblue/os-webrtc-janus), which handles
+`start p2p voice` by recomputing the P2P session id and replying via
+`IEventQueue.ChatterBoxSessionStartReply`. Do not carry a local patch for it; a
+divergent fork is how a grid ends up on a build that predates the fix in the first
+place. The DLL is loaded into the OpenSim process
+at startup via Mono.Addins, so **the region must be restarted** — replacing the file on
+disk has no effect on a running region, and not even on a fresh avatar login, because
+`OnRegisterCaps` still executes the already-loaded assembly.
+
+Verify with (debug logging on):
+
+```
+[REGION WEBRTC VOICE][CHATSESSION]: ChatterBoxSessionStartReply session=<uuid> success=True agent=<uuid>
+```
+
+A useful tell that you are looking at the right thing: two viewers that *don't* gate on
+session initialisation (e.g. a viewer that sends `ImprovedInstantMessage` straight to the
+wire) will IM each other perfectly on an affected grid, while two Firestorms fail. That
+asymmetry is the viewer's precondition, not your IM transport.
+
+### Template and rebuild traps
+
+If your tooling rebuilds a region's `bin/` from a template — the ocean-batch pattern in
+some grid managers does exactly this, `rm -f bin/*` then re-copy — then patching the live
+regions is not enough. **Update the template too**, or the next restart silently reverts
+it. Same applies to whatever template new regions are created from.
+
 ## Rolling out to many regions
 
 The config file is inert until the region restarts, which lets you separate placement
