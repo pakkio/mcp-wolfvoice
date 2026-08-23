@@ -103,12 +103,22 @@ session per audible region, and losing a neighbour connection does not mean they
 
 ## Audio breaks up under load
 
-You are probably at the mixer ceiling. `mixer_loop` is a single task and therefore
-one core; at roughly 14 ms of CPU per listener per second, that saturates around 70
-concurrent listeners and the 20 ms tick starts slipping.
+Look for this in the service log:
 
-Confirm with `examples/load_test.rs` and by watching the service's CPU. Rooms are
-independent, so spreading them across cores is the fix.
+```
+mixer overloaded: N tick(s) skipped in the last 10s
+```
+
+That is the mixer failing to finish a 20 ms tick before the next one is due, so it
+skipped a frame rather than queueing work. The mixer already spreads across all
+cores (one task per room, one per listener), so if you are seeing this the host
+genuinely needs more CPU, or there are more concurrent listeners than it can carry.
+
+Budget roughly **17 ms of CPU per listener per second** and confirm with
+`examples/load_test.rs` on your own hardware.
+
+If you see breakup with *no* overload warnings, it is not the mixer — look at network
+loss between the viewer and the media ports.
 
 ## Certificate expired even though certbot ran
 

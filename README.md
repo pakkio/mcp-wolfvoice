@@ -4,12 +4,17 @@ Spatial WebRTC voice for [OpenSimulator](http://opensimulator.org) — one servi
 Firestorm and browser-based viewers both reach through the region's own capabilities,
 so users of different viewers hear each other, positionally.
 
+wolfvoice is a **voice service backend for
+[os-webrtc-janus](https://github.com/Misterblue/os-webrtc-janus)**. That addon does the
+OpenSimulator half — capabilities, provider advertisement, session bookkeeping — and
+wolfvoice is an alternative to point it at when you want the mixing done differently.
+
 ```
 Firestorm 7.1.10+  /  browser viewer
         │  ProvisionVoiceAccountRequest + VoiceSignalingRequest   (LLSD caps)
         ▼
-OpenSim region  ──  os-webrtc-janus used ONLY as a JSON-RPC relay
-        │           (no Janus server, no OpenSim source changes)
+OpenSim region  +  os-webrtc-janus addon   ← REQUIRED
+        │          forwards the caps onward as JSON-RPC
         ▼
    wolfvoice  ── answers the SDP, terminates DTLS/SRTP/SCTP,
         │         mixes a SEPARATE stream per listener
@@ -17,27 +22,62 @@ OpenSim region  ──  os-webrtc-janus used ONLY as a JSON-RPC relay
    viewers   (UDP media)
 ```
 
-## What makes this different
+## What you need
+
+**os-webrtc-janus is a hard requirement.** It supplies `WebRtcVoice.dll` and the
+region-side capability handlers that everything here depends on; without it there is
+nothing for a viewer to talk to. See [docs/OPENSIM.md](docs/OPENSIM.md) for building it.
+
+What you can skip is running a **Janus gateway server** alongside it. The addon ships
+two backends: `WebRtcJanusService` (which drives Janus) and
+`WebRtcVoiceServiceConnector` (a JSON-RPC client that will post to any URL). wolfvoice
+plugs into the second, so you point the addon at wolfvoice instead of at Janus.
+
+**For the voice server**
+
+- A Linux host with a **public IP address** and a **DNS name** pointing at it. TLS is
+  not optional: the SDP carries the server's DTLS fingerprint, so anyone able to
+  rewrite plaintext signalling in flight could become the media endpoint.
+- **UDP 40000–40999** open to the world. This range is also the ceiling on concurrent
+  sessions — one socket per peer connection.
+- **TCP 9443** reachable *from your region hosts only*. This endpoint has no
+  authentication of its own.
+- Modest CPU: **~17 ms per listener per second**, spread across all cores. See [Capacity](#capacity).
+
+**For viewers**
+
+- **Firestorm 7.1.10 or newer** works with no configuration at all — the region tells
+  it which voice system to use. Nothing to install, nothing to tick.
+- Browser viewers need a client speaking the same contract.
+  [`client/voice_llwebrtc.js`](client/voice_llwebrtc.js) is a working reference
+  implementation, extracted from WolfStorm.
+
+## Why a per-listener mix
 
 Linden Lab's WebRTC voice puts spatialisation, per-user gain and mute on the
 **server**: the viewer sends its position, gain and mute requests *up* a data channel
 and receives one already-mixed audio stream plus a participant roster *down* it.
 
 wolfvoice therefore computes **a distinct mix for every listener**. If A is east of B,
-A hears B on their right while B simultaneously hears A on their left — which a single
-shared room mix cannot express, no matter how it is panned.
+A hears B on their right while B simultaneously hears A on their left — which one
+shared room mix cannot express, however it is panned.
 
-That is also why the usual `os-webrtc-janus` + Janus AudioBridge setup lists "no
-spatial audio, no white dots, no muting, no individual volume" as known issues. All
-four have one root cause: **AudioBridge rejects the data channel.** It has no
-`incoming_data` callback, and Janus's SDP helper rejects an unclaimed
-`m=application` line with `port = 0` — so position, gain, mute and the roster, which
-all travel on that channel, never arrive. Worse, the viewer will not leave
-`VOICE_STATE_WAIT_FOR_DATA_CHANNEL` until the channel opens.
+Janus's AudioBridge plugin is a conference mixer: it produces a single mix for a room,
+and it does not carry WebRTC data channels (no `incoming_data` callback, and Janus's
+SDP helper declines an `m=application` line no plugin has claimed). Those are perfectly
+reasonable choices for what AudioBridge is for, but they mean the parts of LL's
+protocol that ride the data channel — position, per-user gain, mute, the speaker
+roster — have nowhere to travel, and the viewer will not consider voice ready until
+that channel opens. wolfvoice accepts the data channel and does the mixing itself,
+which is the whole reason it exists.
 
-wolfvoice accepts that data channel, and does the mixing itself.
+If you want a straightforward conference-style voice service, os-webrtc-janus with
+Janus is a simpler deployment and the sensible default. Choose wolfvoice when you want
+positional audio.
 
 ## Quick start
+
+### 1. Install the voice server
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/wolfsoftwaresystemsltd/wolfvoice/main/setup.sh
@@ -46,65 +86,111 @@ sudo bash setup.sh
 ```
 
 The installer detects your platform, downloads and checksums the matching release
-binary, creates an unprivileged service user, obtains a TLS certificate with
-certbot (including renewal hooks), and installs a hardened systemd unit. It then
-prints the two things it will not do for you: your firewall rules, and the
-per-region OpenSim config.
+binary, creates an unprivileged service user, obtains a TLS certificate with certbot
+(including renewal hooks), and installs a hardened systemd unit.
 
-## What you need
+### 2. Build os-webrtc-janus into OpenSim
 
-**For the voice server**
+```bash
+cd opensim/addon-modules
+git clone https://github.com/Misterblue/os-webrtc-janus.git
+cd .. && ./runprebuild.sh && ./compile.sh      # or: dotnet build
+```
 
-- A Linux host with a **public IP address** and a **DNS name** pointing at it.
-  TLS is not optional: the SDP carries the server's DTLS fingerprint, so anyone able
-  to rewrite plaintext signalling in flight could become the media endpoint.
-- **UDP 40000–40999** open to the world. This range is also the ceiling on
-  concurrent sessions — one socket per peer connection.
-- **TCP 9443** reachable *from your region hosts only*. This endpoint has no
-  authentication of its own.
-- Modest CPU. Measured cost is **~14 ms of CPU per listener per second**, and it
-  scales with listeners rather than listeners². See [Capacity](#capacity).
+You want `WebRtcVoice.dll` and `WebRtcVoiceServiceModule.dll` in `bin/`.
 
-**For OpenSimulator**
+### 3. Configure each region
 
-- The [os-webrtc-janus](https://github.com/Misterblue/os-webrtc-janus) addon compiled
-  into your OpenSim — it supplies `WebRtcVoice.dll`. **You do not need Janus itself**;
-  wolfvoice uses only that addon's JSON-RPC connector, which will post to any URL.
-- Voice allowed on the **estate** *and* on each **parcel**. This is the most common
-  reason for "nothing happens" — see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+Create **`<region>/bin/config/wolfvoice.ini`** — a copy of
+[`contrib/wolfvoice.ini`](contrib/wolfvoice.ini) — with your server URL:
 
-**For viewers**
+```ini
+[WebRtcVoice]
+    Enabled = true
 
-- **Firestorm 7.1.10 or newer** works with no configuration at all — the region tells
-  it which voice system to use. Nothing to install, nothing to tick.
-- Browser viewers need a client that speaks the same contract.
-  [`client/voice_llwebrtc.js`](client/voice_llwebrtc.js) is a working reference
-  implementation, extracted from WolfStorm.
+    ; Point the addon's JSON-RPC connector at wolfvoice, for both spatial
+    ; (region/parcel) and non-spatial (group, IM) voice.
+    SpatialVoiceService = WebRtcVoice.dll:WebRtcVoiceServiceConnector
+    NonSpatialVoiceService = WebRtcVoice.dll:WebRtcVoiceServiceConnector
+
+    ; Your wolfvoice server. HTTPS, with a certificate .NET will trust.
+    WebRtcVoiceServerURI = https://voice.example.org:9443
+
+    ; Logs entire SDP bodies. Handy on one region while diagnosing.
+    MessageDetails = false
+
+[VivoxVoice]
+    ; Turn Vivox off wherever WebRTC is on: both modules register the SAME
+    ; capability name and the last registration wins, so leaving both enabled
+    ; is a race rather than a choice.
+    enabled = false
+```
+
+Then **restart the region**.
+
+Why `bin/config/` rather than `OpenSim.ini`: OpenSim reads every `.ini` in that
+directory *after* `OpenSim.ini` and treats them as overrides, so a shared or templated
+`OpenSim.ini` can be regenerated without clobbering your voice settings. With one
+OpenSim process per region it also scopes the change to that region alone. (In a
+multi-region simulator, `Enabled` is read once per process, so it applies to every
+region in it.)
+
+### 4. Allow voice on the estate and the parcel
+
+Both are required, and this is the most common reason for "nothing happens":
+
+- Region/Estate → Estate → **Allow Voice Chat**
+- About Land → Sound → **Allow Voice Chat**
+
+With either unset the viewer decides locally that voice is unavailable and never asks
+the region for anything — so **nothing appears in any log**. If you see
+`setting VoiceServerType=webrtc` in the region log and then no provision request,
+this is why.
+
+### 5. Check it
+
+```bash
+# from a permitted region host
+curl https://voice.example.org:9443/
+# {"rooms":0,"service":"wolfvoice","sessions":0}
+```
 
 ## Documentation
 
 | | |
 |---|---|
 | [docs/SERVER.md](docs/SERVER.md) | Installing, running and operating the service; TLS; firewall; capacity |
-| [docs/OPENSIM.md](docs/OPENSIM.md) | Region configuration, the addon, estate/parcel flags, rolling out to many regions |
+| [docs/OPENSIM.md](docs/OPENSIM.md) | The addon, region configuration, estate/parcel flags, rolling out to many regions |
 | [docs/CLIENT.md](docs/CLIENT.md) | Viewer support, and writing your own client |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | The complete wire contract, with citations into the Firestorm and OpenSim sources |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Every failure we hit, and how to tell them apart |
 
 ## Capacity
 
-Measured with `cargo run --release --example load_test`:
+Measured with `cargo run --release --example load_test` on a 12-core VM:
 
-| Clients | Speaking | Service CPU | Per listener |
-|---|---|---|---|
-| 10 | 5 | 12 % of one core | 12.3 ms/s |
-| 40 | 20 | 55 % of one core | 13.8 ms/s |
+| Clients | Speaking | Service CPU | Per listener | Frames delivered |
+|---|---|---|---|---|
+| 10 | 5 | 12 % of one core | 12.3 ms/s | all |
+| 40 | 20 | 57 % of one core | 14.2 ms/s | all |
+| 120 | 60 | **203 % of one core** | 16.9 ms/s | all, no ticks dropped |
 
-Cost is linear in listeners — the per-listener Opus encode dominates, and the
-O(N²) frame summing is comparatively free. **The mix loop is currently a single
-task, so it is confined to one core**, which puts the practical ceiling around
-**70 simultaneous voice users**. Rooms are independent, so spreading them across
-cores is the obvious way to lift it when someone needs to.
+Cost is roughly linear in listeners — the per-listener Opus encode dominates and the
+O(N²) frame summing is comparatively free.
+
+The mixer parallelises on both available axes: each room's tick is its own task, and
+each *listener within* a room is its own task too. That second axis is the one that
+matters, because the interesting case is a single busy region. The 120-listener run
+above is the proof: 203 % of one core means the work genuinely spans cores, and every
+frame still arrived.
+
+So the first limit you will now meet is the **media port range — 1000 concurrent
+sessions**, not CPU (12 cores at ~17 ms per listener is on the order of 700
+listeners before saturation). Widen `MEDIA_PORT_LO`/`HI` and your firewall together
+if you need more.
+
+If the host ever cannot keep up, a whole 20 ms tick is skipped rather than queued —
+audible, but bounded — and the service logs `mixer overloaded` with a count.
 
 ## Building from source
 
@@ -115,8 +201,7 @@ cargo build --release
 cargo test              # 31 tests, no network required
 ```
 
-Release binaries for Linux (x86_64/aarch64, glibc and static musl), macOS
-(Intel/Apple Silicon) and Windows are built by GitHub Actions — see
+Release binaries for Linux, macOS and Windows are built by GitHub Actions — see
 [.github/workflows/release.yml](.github/workflows/release.yml).
 
 ## Testing it without a viewer
@@ -131,9 +216,9 @@ cargo run --release --example load_test -- https://127.0.0.1:9443 40 20
 ```
 
 Run these on the voice host (the JSON-RPC port is firewalled to region hosts, but
-loopback is permitted). Note that both harnesses share the server's own WebRTC
-crate, so they cannot catch a shared misreading of the wire format — a real viewer
-remains the final test.
+loopback is permitted). Both harnesses share the server's own WebRTC crate, so they
+cannot catch a shared misreading of the wire format — a real viewer remains the final
+test.
 
 ## Known limitations
 
@@ -154,9 +239,13 @@ Built by **Wolf Software Systems Ltd** for the
 [Wolf Territories Grid](https://wolfterritories.org), and released for the wider
 OpenSimulator community.
 
-Interoperates with [os-webrtc-janus](https://github.com/Misterblue/os-webrtc-janus)
-by Robert Adams, which supplies the region-side capability handlers this service
-talks to. The wire protocol is Linden Lab's, as implemented in
+wolfvoice stands on **[os-webrtc-janus](https://github.com/Misterblue/os-webrtc-janus)
+by Robert Adams**, which brought WebRTC voice to OpenSimulator and supplies the
+region-side capability handlers, provider advertisement and session plumbing this
+service depends on. wolfvoice is only a backend for it; the hard integration work with
+OpenSimulator is his.
+
+The wire protocol is Linden Lab's, as implemented in
 [Firestorm](https://www.firestormviewer.org/).
 
 ## Licence

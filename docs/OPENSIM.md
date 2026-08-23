@@ -15,10 +15,16 @@ half: registering the `ProvisionVoiceAccountRequest`, `VoiceSignalingRequest` an
 `ParcelVoiceInfoRequest` capabilities, advertising `VoiceServerType = webrtc` to the
 viewer, and forwarding those capability calls onward as JSON-RPC.
 
-**You do not need Janus itself.** We use only the addon's
-`WebRtcVoiceServiceConnector`, which is a plain JSON-RPC 2.0 client that will post to
-any URL. Janus never enters the picture, which is deliberate: Janus AudioBridge
-cannot carry the data channel this protocol depends on.
+The addon ships two voice backends. `WebRtcJanusService` drives a Janus gateway;
+`WebRtcVoiceServiceConnector` is a plain JSON-RPC 2.0 client that will post to any
+URL. wolfvoice plugs into the second, so you do not need to run a **Janus gateway
+server** — but you very much do need this addon.
+
+The reason for choosing the connector rather than Janus is that Janus's AudioBridge
+plugin is a conference mixer: one mix per room, and no WebRTC data channel. The parts
+of Linden Lab's protocol that ride the data channel (position, per-user gain, mute,
+the speaker roster) therefore have nowhere to travel. wolfvoice terminates that
+channel and mixes per listener instead.
 
 Build it in the normal way:
 
@@ -30,8 +36,8 @@ cd ..
 ```
 
 You end up with `WebRtcVoice.dll`, `WebRtcVoiceServiceModule.dll` and
-`WebRtcVoiceRegionModule.dll` in `bin/`. Only the first two are used by this setup;
-`WebRtcJanusService.dll` is not.
+`WebRtcVoiceRegionModule.dll` in `bin/` — all three are needed. `WebRtcJanusService.dll`
+is also built, and is simply unused when you point the connector at wolfvoice.
 
 Check what you actually have deployed rather than trusting the build:
 

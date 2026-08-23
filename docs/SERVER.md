@@ -11,7 +11,7 @@
   public address and forward the media range.
 - **A DNS name** pointing at that address, for TLS.
 - **Ports**: TCP 9443 from your region hosts only; UDP 40000–40999 from anywhere.
-- **CPU**: about 14 ms per listener per second. See [Capacity](#capacity).
+- **CPU**: about 17 ms per listener per second, spread across all cores. See [Capacity](#capacity).
 - To build from source: a Rust toolchain and `cmake` (the `opus` crate compiles
   libopus itself).
 
@@ -138,21 +138,36 @@ Useful log lines:
 
 Measure your own with `examples/load_test.rs`; ours, on a 12-core VM:
 
-| Clients | Speaking | Service CPU | Per listener |
-|---|---|---|---|
-| 10 | 5 | 12 % of one core | 12.3 ms/s |
-| 40 | 20 | 55 % of one core | 13.8 ms/s |
+| Clients | Speaking | Service CPU | Per listener | Frames delivered |
+|---|---|---|---|---|
+| 10 | 5 | 12 % of one core | 12.3 ms/s | all |
+| 40 | 20 | 57 % of one core | 14.2 ms/s | all |
+| 120 | 60 | **203 % of one core** | 16.9 ms/s | all, no ticks dropped |
 
-Cost is linear in listeners; the per-listener Opus encode dominates and the O(N²)
-frame summing is comparatively free. Speaker count barely matters.
+Cost is roughly linear in listeners; the per-listener Opus encode dominates and the
+O(N²) frame summing is comparatively free. Speaker count barely matters.
 
-Two ceilings, in the order you will hit them:
+The mixer uses every core available to it: one task per room, and one task per
+listener within a room. Both axes are needed — per-room parallelism alone would still
+put a single busy region on a single core, which is exactly the case that matters.
 
-1. **~70 concurrent listeners** — `mixer_loop` is a single task, so all mixing runs
-   on one core. Past this the 20 ms tick slips and audio breaks up. Rooms are
-   independent, so fanning them across cores lifts this by roughly the core count.
-2. **1000 sessions** — one UDP socket per peer connection, bounded by the media port
+Ceilings, in the order you will meet them:
+
+1. **1000 sessions** — one UDP socket per peer connection, bounded by the media port
    range. Widen the range and `MEDIA_PORT_HI` together.
+2. **CPU** — at ~17 ms per listener per second, a 12-core host is in the region of
+   700 listeners before saturating. Scale cores with expected crowd size.
+
+Overload is handled by dropping whole 20 ms ticks rather than queueing work, so a
+struggling host degrades audibly but predictably instead of growing a task backlog
+until it dies. Watch for:
+
+```
+mixer overloaded: N tick(s) skipped in the last 10s
+```
+
+Skipping a tick also guarantees the previous tick's work has drained, so two frames
+for the same endpoint can never race and emit RTP timestamps out of order.
 
 Sessions are per viewer *per audible region*: a viewer near a region corner can hold
 up to four at once, because Firestorm probes eight compass directions at twice its

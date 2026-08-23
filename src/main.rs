@@ -219,13 +219,53 @@ impl App {
     }
 }
 
-/// Mixer loop: one pass per room per 20 ms.
+/// Mixer loop: one pass per room per 20 ms, spread across all available cores.
+///
+/// The work parallelises on two independent axes, and we use both:
+///
+///   * **rooms** never interact, so each room's tick is its own task;
+///   * **listeners within a room** each need their own Opus encode, which is the
+///     dominant cost, and those are independent too — so each listener is its own
+///     task as well. That second axis matters because the interesting case is one
+///     busy region, where per-room parallelism alone would still leave everything
+///     on a single core.
+///
+/// Task churn is real but small against the work: an encode is hundreds of
+/// microseconds, a tokio spawn is a couple.
+///
+/// Overload behaviour is deliberate. A tick is skipped entirely if the previous
+/// tick's tasks have not all finished. That gives two things at once: outstanding
+/// work for one endpoint can never overlap itself (which would let two frames race
+/// and emit RTP timestamps out of order), and a server that cannot keep up degrades
+/// by dropping whole frames — audible, but bounded — rather than growing a task
+/// queue until it dies.
 async fn mixer_loop(app: Arc<App>) {
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut skipped: u64 = 0;
+    let mut last_warned = std::time::Instant::now();
+
     loop {
         ticker.tick().await;
+
+        if inflight.load(Ordering::Acquire) != 0 {
+            skipped += 1;
+            // Rate-limit the complaint; at 50 ticks a second an unthrottled log
+            // would itself become the bottleneck.
+            if last_warned.elapsed() >= Duration::from_secs(10) {
+                log::warn!(
+                    "mixer overloaded: {skipped} tick(s) skipped in the last 10s \
+                     ({} sessions). Audio will break up; the host needs more CPU \
+                     or fewer concurrent listeners.",
+                    app.sessions.session_count()
+                );
+                skipped = 0;
+                last_warned = std::time::Instant::now();
+            }
+            continue;
+        }
 
         // Reap anything the transport marked dead before mixing.
         let dead: Vec<String> = app
@@ -251,23 +291,39 @@ async fn mixer_loop(app: Arc<App>) {
                 continue;
             }
 
-            let outputs = room::mix_room(&members);
-            for out in outputs {
-                let Some(ep) = app.endpoint(&out.session.id) else {
-                    continue;
-                };
-                // Nothing can be sent before the data channel opens, and the
-                // viewer is not in VOICE_STATE_SESSION_UP until it does.
-                if !ep.data_channel_open() {
-                    continue;
+            let app = app.clone();
+            let inflight = inflight.clone();
+            inflight.fetch_add(1, Ordering::AcqRel);
+            tokio::spawn(async move {
+                // Summing is cheap next to the encodes and needs the whole room's
+                // frames at once, so it stays inline in the room's own task.
+                let outputs = room::mix_room(&members);
+
+                let mut handles = Vec::with_capacity(outputs.len());
+                for out in outputs {
+                    let app = app.clone();
+                    handles.push(tokio::spawn(async move {
+                        let Some(ep) = app.endpoint(&out.session.id) else {
+                            return;
+                        };
+                        // Nothing can be sent before the data channel opens, and
+                        // the viewer is not in VOICE_STATE_SESSION_UP until it does.
+                        if !ep.data_channel_open() {
+                            return;
+                        }
+                        if let Some(roster) = out.roster {
+                            ep.send_roster(&roster).await;
+                        }
+                        if let Err(e) = ep.send_mix(&out.stereo).await {
+                            log::debug!("send_mix {}: {e}", out.session.id);
+                        }
+                    }));
                 }
-                if let Some(roster) = out.roster {
-                    ep.send_roster(&roster).await;
+                for h in handles {
+                    let _ = h.await;
                 }
-                if let Err(e) = ep.send_mix(&out.stereo).await {
-                    log::debug!("send_mix {}: {e}", out.session.id);
-                }
-            }
+                inflight.fetch_sub(1, Ordering::AcqRel);
+            });
         }
     }
 }

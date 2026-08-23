@@ -251,8 +251,9 @@ cat <<EOF
    a) Copy contrib/wolfvoice.ini to  <region>/bin/config/wolfvoice.ini
       and set:
           WebRtcVoiceServerURI = https://$hostname_fqdn:${RPC_PORT}
-      Your OpenSim must have the os-webrtc-janus addon compiled in (it provides
-      WebRtcVoice.dll). You do NOT need Janus itself. Then restart the region.
+      Your OpenSim MUST have the os-webrtc-janus addon compiled in — it provides
+      WebRtcVoice.dll and the region-side capabilities. You do not need to run a
+      Janus gateway alongside it. Then restart the region.
 
    b) ALLOW VOICE ON THE ESTATE AND THE PARCEL.
           About Land -> Sound -> Allow Voice Chat
