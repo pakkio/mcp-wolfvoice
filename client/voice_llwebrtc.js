@@ -151,9 +151,14 @@ class VoiceLLWebRTC {
         this._closing = false;
         this._roomKey = roomKey;
 
+        // THROW, do not return. voice_manager._rejoin() retries switchRoom() with
+        // backoff precisely because caps and parcel data arrive over the seconds
+        // after a region crossing — but only if the promise REJECTS. Returning
+        // normally reported success, so the retry never ran and voice stayed down
+        // until the user toggled it by hand. No toast here either: the manager
+        // reports once after it has exhausted its attempts, rather than per attempt.
         if (!this._cap('ProvisionVoiceAccountRequest')) {
-            this.mgr._reportError('This region does not offer WebRTC voice.');
-            return;
+            throw new Error('region has not granted ProvisionVoiceAccountRequest yet');
         }
 
         if (!this.localStream) {
@@ -213,23 +218,21 @@ class VoiceLLWebRTC {
             + '</map></llsd>';
 
         const reply = await this._capPost('ProvisionVoiceAccountRequest', body);
+        // These all THROW so a rejoin is retried — see the note in start().
         if (!reply || typeof reply !== 'object') {
-            this.mgr._reportError('Voice server did not answer the connection request.');
-            await this._teardown();
-            return;
+            await this._teardown(true);
+            throw new Error('voice server did not answer the provision request');
         }
         if (reply.error) {
-            this.mgr._reportError(`Voice server refused the connection: ${reply.error}`);
-            await this._teardown();
-            return;
+            await this._teardown(true);
+            throw new Error(`voice server refused the connection: ${reply.error}`);
         }
 
         const jsep = reply.jsep;
         const sdp = jsep && jsep.sdp;
         if (!reply.viewer_session || !sdp) {
-            this.mgr._reportError('Voice server sent an incomplete answer.');
-            await this._teardown();
-            return;
+            await this._teardown(true);
+            throw new Error('voice server sent an incomplete answer (no viewer_session or sdp)');
         }
 
         this.viewerSession = String(reply.viewer_session);
@@ -643,10 +646,15 @@ class VoiceLLWebRTC {
      * fresh provision to land in the right room.
      */
     async switchRoom(roomKey, token) {
-        if (roomKey === this._roomKey) return;
+        // Only skip when we are ALREADY CONNECTED to this room. The old guard
+        // compared the key alone, and switchRoom committed _roomKey before
+        // connecting — so once a rejoin failed, every retry for that same room
+        // returned here immediately and voice could never recover from a teleport.
+        if (roomKey === this._roomKey && this.isConnected()) return;
         console.log(`[Voice] switching room ${this._roomKey} -> ${roomKey}`);
-        this._roomKey = roomKey;
         await this._teardown(/* keepMic */ true);
+        // start() sets _roomKey itself, and throws if it cannot connect, which is
+        // what lets voice_manager retry.
         await this.start(roomKey, token);
     }
 

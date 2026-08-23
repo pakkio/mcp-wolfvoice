@@ -207,10 +207,15 @@ impl App {
         self.endpoints.write().insert(id.clone(), Arc::new(ep));
         self.sessions.insert(sess);
 
+        // The PARCEL is logged deliberately: spatial rooms are keyed on region +
+        // parcel, so "why can these two not hear each other" is almost always
+        // answered by them being on different parcels — and that is unanswerable
+        // from the log without this field.
         log::info!(
-            "session {id} agent {} region {} port {port} spatial={spatial} ({} live)",
+            "session {id} agent {} region {} parcel {} port {port} spatial={spatial} ({} live)",
             params.user_id,
             params.scene,
+            req.parcel_local_id,
             self.sessions.session_count()
         );
 
