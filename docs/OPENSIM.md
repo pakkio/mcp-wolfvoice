@@ -1,0 +1,158 @@
+# Configuring OpenSimulator
+
+Three things must be true before a viewer will use wolfvoice. Miss any one and the
+symptom is silence with nothing obvious in the logs.
+
+1. Your OpenSim has the **os-webrtc-janus addon** compiled in.
+2. The region is **configured** to send voice to wolfvoice.
+3. Voice is **allowed on the estate and on the parcel**.
+
+## 1. The addon
+
+wolfvoice does not talk to OpenSim directly. It relies on
+[os-webrtc-janus](https://github.com/Misterblue/os-webrtc-janus) for the region-side
+half: registering the `ProvisionVoiceAccountRequest`, `VoiceSignalingRequest` and
+`ParcelVoiceInfoRequest` capabilities, advertising `VoiceServerType = webrtc` to the
+viewer, and forwarding those capability calls onward as JSON-RPC.
+
+**You do not need Janus itself.** We use only the addon's
+`WebRtcVoiceServiceConnector`, which is a plain JSON-RPC 2.0 client that will post to
+any URL. Janus never enters the picture, which is deliberate: Janus AudioBridge
+cannot carry the data channel this protocol depends on.
+
+Build it in the normal way:
+
+```bash
+cd opensim/addon-modules
+git clone https://github.com/Misterblue/os-webrtc-janus.git
+cd ..
+./runprebuild.sh && ./compile.sh     # or dotnet build
+```
+
+You end up with `WebRtcVoice.dll`, `WebRtcVoiceServiceModule.dll` and
+`WebRtcVoiceRegionModule.dll` in `bin/`. Only the first two are used by this setup;
+`WebRtcJanusService.dll` is not.
+
+Check what you actually have deployed rather than trusting the build:
+
+```bash
+tr -d '\000' < bin/WebRtcVoice.dll | grep -c provision_voice_account_request
+# 1 or more means the connector is present
+```
+
+## 2. Region configuration
+
+Copy `contrib/wolfvoice.ini` to `<region>/bin/config/wolfvoice.ini` and set your
+server URL:
+
+```ini
+[WebRtcVoice]
+    Enabled = true
+    SpatialVoiceService = WebRtcVoice.dll:WebRtcVoiceServiceConnector
+    NonSpatialVoiceService = WebRtcVoice.dll:WebRtcVoiceServiceConnector
+    WebRtcVoiceServerURI = https://voice.example.org:9443
+    MessageDetails = false
+
+[VivoxVoice]
+    enabled = false
+```
+
+Then restart the region.
+
+**Why `bin/config/` and not `OpenSim.ini`.** OpenSim reads every `.ini` in that
+directory *after* `OpenSim.ini` and treats them as overrides
+(`OpenSim/Region/Application/ConfigurationLoader.cs` — "Override distro settings with
+contents of inidirectory", default `inidirectory = "config"`). So a shared or
+templated `OpenSim.ini` can be regenerated without clobbering your voice config. If
+you run one OpenSim process per region, it also means the change is scoped to that
+region alone.
+
+**Turn Vivox off wherever WebRTC is on.** Both modules register the *same*
+capability name, and the last registration wins (`CapsHandlers.AddSimpleHandler`
+removes any existing entry before adding). Leaving both enabled is a race, not a
+choice.
+
+**One process, many regions?** `[WebRtcVoice] Enabled` is read once per *process*, so
+in a multi-region simulator this switches every region in that process.
+
+**`MessageDetails`** logs entire SDP bodies. Invaluable on one region while
+diagnosing; wasteful across a fleet.
+
+## 3. Estate and parcel flags
+
+This is the one that catches everyone. The viewer checks **both** before it will even
+create a voice session:
+
+```cpp
+// llvoicewebrtc.cpp
+voiceEnabled = voiceEnabled && regionp->isVoiceEnabled();   // estate/region flag
+if (voiceEnabled) {
+    if (!parcel->getParcelFlagAllowVoice()) voiceEnabled = false;   // parcel flag
+}
+if (!voiceEnabled) leaveChannel(true);   // no session, no provision, no log
+```
+
+So:
+
+- **Estate**: Region/Estate → Estate → *Allow Voice Chat*
+  (OpenSim exposes this as `EstateSettings.AllowVoice`, which becomes the
+  `REGION_FLAGS_ALLOW_VOICE` region flag).
+- **Parcel**: About Land → Sound → *Allow Voice Chat*
+  (`PF_ALLOW_VOICE_CHAT`, bit 29 of the parcel flags).
+
+The failure mode is genuinely silent: the region log will happily show
+`setting VoiceServerType=webrtc`, and then no provision request ever arrives, because
+the viewer decided locally that voice is not available here. If you see that pattern,
+check these flags first.
+
+Auditing a whole grid, if your regions share a content database:
+
+```sql
+SELECT COUNT(*) AS parcels,
+       SUM((LandFlags & 536870912) <> 0) AS voice_on,
+       SUM((LandFlags & 536870912) =  0) AS voice_off
+FROM land;
+```
+
+Do not simply set the bit for everyone — parcel voice may be off deliberately, and it
+is the landowner's setting. Also note that a running region holds land data in memory
+and will overwrite a database edit on its next save, so change it in-world or before
+a restart.
+
+## Rolling out to many regions
+
+The config file is inert until the region restarts, which lets you separate placement
+from activation:
+
+```bash
+# 1. place everywhere (no impact)
+for d in /path/to/regions/*/bin; do
+    install -d "$d/config"
+    install -m0644 wolfvoice.ini "$d/config/wolfvoice.ini"
+done
+
+# 2. activate on your normal restart cycle, or stagger deliberately
+```
+
+Stagger the restarts. A thousand regions re-registering at once will hammer your
+Robust and asset services far harder than the voice change itself. If you already
+restart regions on a schedule, place the file and let that cycle do the work.
+
+**Validate on one region before touching the fleet.** A malformed ini can stop a
+region booting, and discovering that across a thousand regions is a bad afternoon.
+After the first restart, confirm:
+
+```bash
+grep -E "REGION WEBRTC VOICE\]: enabled|WebRtcVoiceServiceConnector enabled" OpenSim.log
+grep -c VivoxVoice OpenSim.log     # should be 0 for this boot
+```
+
+**New regions.** Whatever provisions your regions needs to place this file too.
+If region directories are created from a template, put `bin/config/wolfvoice.ini` in
+the template; if a script builds them, have it copy the file from one canonical
+location so voice config is edited in a single place.
+
+## Rollback
+
+Delete `bin/config/wolfvoice.ini` (or set `Enabled = false`), re-enable
+`[VivoxVoice]` if you want it back, and restart the region.

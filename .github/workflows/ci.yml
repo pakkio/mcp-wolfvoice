@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      # The unit tests cover the two halves that need no network: the wire
+      # protocol parsers, and the spatial mixer (including the per-listener
+      # separation that is the whole point of the service).
+      - name: Test
+        run: cargo test --locked
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build examples
+        run: cargo build --locked --examples
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck setup.sh and hooks
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck setup.sh contrib/*.sh

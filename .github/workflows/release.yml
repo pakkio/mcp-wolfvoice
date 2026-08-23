@@ -1,0 +1,113 @@
+name: release
+
+# Builds wolfvoice for every supported platform and attaches the binaries to a
+# GitHub Release. Triggered by pushing a tag like v0.1.0, or manually.
+#
+# setup.sh downloads from these release assets, so the asset NAMES are part of the
+# interface — see the `asset` field in the matrix and keep it in step with setup.sh.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: wolfvoice-x86_64-linux-gnu
+          # Static build: runs on any Linux regardless of glibc version. This is
+          # what setup.sh prefers on x86_64 Linux.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: wolfvoice-x86_64-linux-musl
+            musl: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: wolfvoice-aarch64-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: wolfvoice-aarch64-linux-musl
+            musl: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: wolfvoice-aarch64-macos
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset: wolfvoice-x86_64-macos
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: wolfvoice-x86_64-windows.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # libopus is compiled from source by the opus crate via cmake, so cmake is
+      # required on every platform. The GitHub runners already have it.
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools musl-dev
+
+      - name: Build
+        shell: bash
+        env:
+          # `CC_*` only affects build scripts (the cc/cmake crates). The FINAL link
+          # needs the target linker set explicitly, or cargo uses the system `cc`
+          # and libopus.a fails to resolve libm symbols (sqrt, exp, log...).
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage asset
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/wolfvoice.exe" "dist/${{ matrix.asset }}"
+          else
+            cp "target/${{ matrix.target }}/release/wolfvoice" "dist/${{ matrix.asset }}"
+            chmod +x "dist/${{ matrix.asset }}"
+          fi
+          # Publish a checksum next to each binary so setup.sh can verify it.
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

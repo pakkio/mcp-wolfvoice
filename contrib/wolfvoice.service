@@ -1,0 +1,51 @@
+[Unit]
+Description=wolfvoice — shared WebRTC voice service for OpenSimulator
+Documentation=https://github.com/wolfsoftwaresystemsltd/wolfvoice
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=wolfvoice
+Group=wolfvoice
+ExecStart=/usr/local/bin/wolfvoice
+
+Environment=RUST_LOG=info
+
+# REQUIRED. The PUBLIC address viewers must send voice media to. There is no
+# default: it is the only address a viewer ever learns, because the Linden Lab
+# voice protocol gives the server no way to trickle ICE candidates. Behind 1:1 NAT
+# put the PUBLIC address here and forward the media port range to this host.
+Environment=WOLFVOICE_PUBLIC_IP=203.0.113.10
+
+Restart=always
+RestartSec=2
+
+# Hardening. The service needs nothing but its TLS keypair and its sockets.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadOnlyPaths=/etc/wolfvoice
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Bounds a runaway rather than sizing normal use.
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

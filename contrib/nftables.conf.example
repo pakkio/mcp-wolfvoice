@@ -1,0 +1,92 @@
+#!/usr/sbin/nft -f
+#
+# Example firewall for a wolfvoice host. Adapt the addresses, then:
+#     cp this /etc/nftables.conf && nft -f /etc/nftables.conf
+#     systemctl enable --now nftables
+#
+# Default-deny inbound. What needs to be reachable:
+#
+#   22/tcp            SSH. Use keys, not passwords.
+#   9443/tcp          The JSON-RPC voice service, over TLS. Restrict this to your
+#                     OpenSim region hosts — THE ENDPOINT HAS NO AUTHENTICATION OF
+#                     ITS OWN. OpenSim's WebRtcVoiceServiceConnector posts a bare
+#                     JSON-RPC body with no credential, so this rule plus the TLS
+#                     certificate is the entire security boundary.
+#   40000-40999/udp   WebRTC media (ICE/DTLS/SRTP/SCTP). Must be open to the world:
+#                     viewers dial in from arbitrary networks. Keep this range in
+#                     sync with MEDIA_PORT_LO/HI in src/main.rs.
+#   80/tcp            ONLY while a certbot renewal is running — see the hooks in
+#                     this directory. The @certbot_open set is empty on disk, so a
+#                     reboot mid-renewal leaves it closed.
+#
+# IMPORTANT — MEASURE your region hosts' egress addresses, do not assume them.
+# A region running in a NATed container presents its HOST's address, not its own,
+# and that may differ from the hostname you ssh to. To measure it: run
+# `nc -l -p 9999` on this host and connect to it on port 9999 from the region
+# machine; the listener prints the address you need.
+#
+# NOTE on nftables semantics: a packet must survive EVERY base chain on a hook.
+# `accept` is terminal only within its own chain, so an allow rule for a new port
+# MUST live in the chain below — putting it in a separate table would still leave
+# the packet to be killed by this chain's drop policy.
+#
+# LOCKOUT SAFETY: before applying a default-drop ruleset over SSH, arm a rollback
+#     systemd-run --on-active=240 --unit=nft-rollback /usr/sbin/nft flush ruleset
+# then apply, then prove a BRAND NEW ssh connection works (your existing one
+# survives on `ct state established` and proves nothing), then
+#     systemctl stop nft-rollback.timer
+
+flush ruleset
+
+table inet filter {
+    # OpenSim region hosts permitted to reach the JSON-RPC endpoint.
+    # Replace with your own measured egress addresses.
+    set voice_rpc_clients {
+        type ipv4_addr
+        elements = {
+            203.0.113.10,     # region host 1
+            203.0.113.11,     # region host 2
+        }
+    }
+
+    # Held empty. certbot's hooks add and remove 80 around each ACME challenge.
+    set certbot_open {
+        type inet_service
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        iif lo accept
+        ct state established,related accept
+        ct state invalid drop
+
+        # Diagnostics, rate-limited so they cannot be used as an amplifier.
+        ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded, parameter-problem } limit rate 10/second accept
+        ip6 nexthdr icmpv6 icmpv6 type { echo-request, destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } limit rate 20/second accept
+
+        # SSH. Use fail2ban for banning; this only blunts connection floods.
+        tcp dport 22 ct state new limit rate 15/minute burst 15 packets accept
+        tcp dport 22 ct state new counter drop
+
+        # ACME http-01, only while a renewal is in flight.
+        tcp dport @certbot_open accept
+
+        # Voice service JSON-RPC over TLS — region hosts only.
+        ip saddr @voice_rpc_clients tcp dport 9443 accept
+
+        # WebRTC media.
+        udp dport 40000-40999 accept
+
+        counter comment "input dropped"
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+        counter comment "forward dropped"
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}
