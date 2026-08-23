@@ -163,12 +163,19 @@ so leaving that value empty is fine.
 
 ### If you are on an older addon build
 
-**Update the addon** — this is fixed upstream in
+This is fixed upstream in
 [os-webrtc-janus](https://github.com/Misterblue/os-webrtc-janus), which handles
 `start p2p voice` by recomputing the P2P session id and replying via
-`IEventQueue.ChatterBoxSessionStartReply`. Do not carry a local patch for it; a
-divergent fork is how a grid ends up on a build that predates the fix in the first
-place. The DLL is loaded into the OpenSim process
+`IEventQueue.ChatterBoxSessionStartReply`. **Update the addon if you can.**
+
+Check first whether you actually can: current upstream uses API that older OpenSim trees
+do not have (`OSDMap.TryGetUUID` / `TryGetString`, `UUID.ulonga`/`ulongb`). If your
+OpenSim predates those, the current addon will not build against it, and updating the
+addon means updating OpenSim too. In that case adding the handler to your existing
+`WebRtcVoiceRegionModule.cs` is the legitimate short path — it needs only
+`IEventQueue.ChatterBoxSessionStartReply`, which has been present for a long time.
+
+Whichever route, the DLL is loaded into the OpenSim process
 at startup via Mono.Addins, so **the region must be restarted** — replacing the file on
 disk has no effect on a running region, and not even on a fresh avatar login, because
 `OnRegisterCaps` still executes the already-loaded assembly.
