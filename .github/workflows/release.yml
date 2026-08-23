@@ -38,18 +38,22 @@ jobs:
             target: aarch64-unknown-linux-musl
             asset: wolfvoice-aarch64-linux-musl
             musl: true
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            asset: wolfvoice-aarch64-macos
-          # Cross-compiled from the arm64 macOS runner: the macos-13 (x86_64)
-          # runner image has been retired, and a job requesting it simply queues
-          # forever. Xcode ships both SDKs, so this links fine.
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            asset: wolfvoice-x86_64-macos
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            asset: wolfvoice-x86_64-windows.exe
+          # macOS and Windows are NOT built here, deliberately. Both are blocked on
+          # the same upstream knot in the opus crate, which vendors libopus and
+          # builds it with cmake:
+          #
+          #   * libopus declares cmake_minimum_required(VERSION 3.1), and CMake 4
+          #     — which those runner images now ship — refuses it outright:
+          #     "Compatibility with CMake < 3.5 has been removed from CMake."
+          #   * Pinning CMake 3.31 fixes that, but 3.31 does not know the
+          #     "Visual Studio 18 2026" generator on the current Windows image,
+          #     so Windows swaps one failure for another.
+          #
+          # A voice service runs on Linux in practice, so rather than ship a
+          # fragile workaround this is left to `cargo build --release` from source
+          # on those platforms, where the developer's own cmake is whatever works.
+          # Worth revisiting when the opus crate's vendored libopus updates its
+          # cmake_minimum_required.
 
     steps:
       - uses: actions/checkout@v4
@@ -63,19 +67,6 @@ jobs:
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y musl-tools musl-dev
 
-      # libopus is compiled from source by the opus crate via cmake. Its
-      # CMakeLists declares cmake_minimum_required(VERSION 3.1), and CMake 4 —
-      # which the Windows and macOS runner images now ship — refuses outright:
-      #   "Compatibility with CMake < 3.5 has been removed from CMake."
-      # Pinning CMake 3.31 is deterministic; relying on the policy-override
-      # escape hatch is not, since it depends on how the cmake crate forwards it.
-      - name: Pin CMake 3.31 (libopus predates CMake 4's policy floor)
-        if: runner.os != 'Linux'
-        shell: bash
-        run: |
-          python -m pip install --upgrade "cmake==3.31.6"
-          cmake --version
-
       - name: Build
         shell: bash
         env:
@@ -86,10 +77,12 @@ jobs:
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-          # musl keeps the math functions in libc, but libopus.a lands AFTER -lc
-          # on the link line, so its references to sqrtf/exp/log/lrintf go
-          # unresolved. Appending -lm fixes the order.
-          RUSTFLAGS: ${{ matrix.musl && '-C link-arg=-lm' || '' }}
+          # musl ships libm.a as a STUB — the math functions actually live in
+          # libc.a — and static linking resolves left to right, so libopus.a
+          # appearing after libc leaves sqrtf/exp/log/lrintf unresolved.
+          # Appending -lm alone changed nothing for exactly that reason; libc has
+          # to come round a second time, after libopus.
+          RUSTFLAGS: ${{ matrix.musl && '-C link-arg=-lm -C link-arg=-lc' || '' }}
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Stage asset

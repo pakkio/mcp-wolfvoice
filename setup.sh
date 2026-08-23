@@ -44,29 +44,18 @@ step() { printf '\n==> %s\n' "$*"; }
 step "Detecting platform"
 os=$(uname -s)
 arch=$(uname -m)
+# Two candidates per platform, tried in order. The static musl build is
+# preferred because it does not care about your glibc version, which matters on
+# older distributions; the gnu build is the fallback.
 case "$os:$arch" in
-    # Prefer the static musl builds on Linux: they do not care about your glibc
-    # version, which matters on older distributions.
-    Linux:x86_64)          asset=wolfvoice-x86_64-linux-musl ;;
-    Linux:aarch64|Linux:arm64) asset=wolfvoice-aarch64-linux-musl ;;
-    Darwin:arm64)          asset=wolfvoice-aarch64-macos ;;
-    Darwin:x86_64)         asset=wolfvoice-x86_64-macos ;;
-    *) die "no prebuilt binary for $os/$arch — build from source: cargo build --release" ;;
+    Linux:x86_64)              assets="wolfvoice-x86_64-linux-musl wolfvoice-x86_64-linux-gnu" ;;
+    Linux:aarch64|Linux:arm64) assets="wolfvoice-aarch64-linux-musl wolfvoice-aarch64-linux-gnu" ;;
+    *) die "no prebuilt binary for $os/$arch — build from source:
+    git clone https://github.com/$REPO && cd wolfvoice && cargo build --release
+  (needs a Rust toolchain and cmake; macOS and Windows are build-from-source
+   only, see .github/workflows/release.yml for why)" ;;
 esac
-info "$os/$arch  ->  $asset"
-
-if [ "$os" != "Linux" ]; then
-    cat <<EOF
-
-This installer configures a systemd service and is Linux-only. On $os you can
-still run the binary by hand:
-
-    WOLFVOICE_PUBLIC_IP=<your public ip> ./$asset
-
-See docs/SERVER.md for what else needs setting up.
-EOF
-    exit 0
-fi
+info "$os/$arch  ->  ${assets%% *}"
 
 command -v systemctl >/dev/null || die "systemd is required by this installer"
 
@@ -110,8 +99,17 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 base="https://github.com/$REPO/releases/latest/download"
-curl -fsSL "$base/$asset"        -o "$tmp/wolfvoice" || die "download failed: $base/$asset"
-curl -fsSL "$base/$asset.sha256" -o "$tmp/sum"       || die "checksum download failed"
+asset=""
+for candidate in $assets; do
+    if curl -fsSL "$base/$candidate" -o "$tmp/wolfvoice" 2>/dev/null \
+    && curl -fsSL "$base/$candidate.sha256" -o "$tmp/sum" 2>/dev/null; then
+        asset="$candidate"
+        break
+    fi
+    info "not in this release: $candidate"
+done
+[ -n "$asset" ] || die "no usable binary for $os/$arch in the latest release"
+info "using $asset"
 
 step "Verifying checksum"
 want=$(awk '{print $1}' "$tmp/sum")
