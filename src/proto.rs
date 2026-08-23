@@ -309,6 +309,16 @@ pub const PEER_GAIN_CONVERSION_FACTOR: f32 = 220.0;
 /// Source: llvoicewebrtc.cpp:1226-1249 multiplies metres by 100 before sending.
 pub const POSITION_SCALE: f64 = 100.0;
 
+/// Most `ug`/`m` entries we will accept from a single data-channel message, and
+/// the ceiling on how many a session may accumulate. Far above any real room size.
+pub const MAX_PEER_ENTRIES: usize = 256;
+
+/// Largest gain a listener may request for one speaker. The viewer's own slider
+/// tops out at 2.0 (`ug` = 440); a raw u32 would otherwise divide down to a gain
+/// of ~19 million, which is a request to blow someone's ears off rather than a
+/// volume setting.
+pub const MAX_PEER_GAIN: f32 = 4.0;
+
 fn vec3(v: &Value) -> Option<[f64; 3]> {
     Some([
         v.get("x")?.as_f64()? / POSITION_SCALE,
@@ -348,15 +358,20 @@ impl ViewerDataMessage {
         if let Some(x) = v.get("lh") {
             m.listener_rot = vec4(x);
         }
+        // These two maps arrive from the VIEWER, so they are attacker-controlled by
+        // any grid user. Cap the number of entries taken from one message: a
+        // legitimate client only ever adjusts the people it can hear, and without a
+        // cap a single object with a million keys grows this session's state
+        // without bound.
         if let Some(obj) = v.get("ug").and_then(Value::as_object) {
-            for (k, val) in obj {
+            for (k, val) in obj.iter().take(MAX_PEER_ENTRIES) {
                 if let Some(g) = val.as_u64() {
                     m.user_gain.push((k.clone(), g as u32));
                 }
             }
         }
         if let Some(obj) = v.get("m").and_then(Value::as_object) {
-            for (k, val) in obj {
+            for (k, val) in obj.iter().take(MAX_PEER_ENTRIES) {
                 if let Some(b) = val.as_bool() {
                     m.user_mute.push((k.clone(), b));
                 }

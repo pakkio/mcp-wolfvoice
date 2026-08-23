@@ -126,6 +126,21 @@ impl Session {
             self.primary.store(primary, Ordering::Relaxed);
         }
 
+        // Reject anything not finite before it reaches the mixer. JSON can carry
+        // 1e308, and squaring that gives inf; inf/inf in the panning maths is NaN,
+        // which would then be summed into the mix and handed to the Opus encoder.
+        let finite3 = |v: Option<[f64; 3]>| v.filter(|a| a.iter().all(|c| c.is_finite()));
+        let finite4 = |v: Option<[f64; 4]>| v.filter(|a| a.iter().all(|c| c.is_finite()));
+        let m = &proto::ViewerDataMessage {
+            join: m.join,
+            avatar_pos: finite3(m.avatar_pos),
+            avatar_rot: finite4(m.avatar_rot),
+            listener_pos: finite3(m.listener_pos),
+            listener_rot: finite4(m.listener_rot),
+            user_gain: m.user_gain.clone(),
+            user_mute: m.user_mute.clone(),
+        };
+
         if m.avatar_pos.is_some()
             || m.avatar_rot.is_some()
             || m.listener_pos.is_some()
@@ -156,13 +171,21 @@ impl Session {
         if !m.user_gain.is_empty() {
             let mut g = self.gains.write();
             for (id, raw) in &m.user_gain {
-                g.insert(id.clone(), *raw as f32 / proto::PEER_GAIN_CONVERSION_FACTOR);
+                // Clamped: a raw u32 divides down to a gain of ~19 million, and the
+                // map is bounded so a client cannot grow it without limit.
+                let gain = (*raw as f32 / proto::PEER_GAIN_CONVERSION_FACTOR)
+                    .clamp(0.0, proto::MAX_PEER_GAIN);
+                if g.len() < proto::MAX_PEER_ENTRIES || g.contains_key(id) {
+                    g.insert(id.clone(), gain);
+                }
             }
         }
         if !m.user_mute.is_empty() {
             let mut mu = self.mutes.write();
             for (id, muted) in &m.user_mute {
-                mu.insert(id.clone(), *muted);
+                if mu.len() < proto::MAX_PEER_ENTRIES || mu.contains_key(id) {
+                    mu.insert(id.clone(), *muted);
+                }
             }
         }
     }

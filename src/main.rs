@@ -14,6 +14,7 @@ mod room;
 mod session;
 
 use bytes::Bytes;
+use hyper::body::HttpBody as _;
 use hyper::service::service_fn;
 use hyper::{Body, Method, Request, Response, StatusCode};
 use serde_json::{json, Value};
@@ -56,6 +57,17 @@ const TLS_KEY: &str = "/etc/wolfvoice/tls/privkey.pem";
 
 /// Mixer cadence. One Opus frame per tick per listener.
 const TICK: Duration = Duration::from_millis(20);
+
+/// Largest JSON-RPC body we will read. The biggest legitimate one is an SDP offer
+/// plus a trickled ICE candidate list; a few hundred KiB is ample.
+const MAX_RPC_BODY: usize = 256 * 1024;
+
+/// Ceiling on concurrent sessions, checked before we allocate a media port.
+/// Without it, anything able to reach the JSON-RPC port can exhaust the UDP port
+/// range and the mixer's CPU budget just by asking for sessions. Kept below the
+/// port range (MEDIA_PORT_HI - MEDIA_PORT_LO) so port allocation cannot wrap onto
+/// a port still in use.
+const MAX_SESSIONS: usize = 900;
 
 struct App {
     sessions: room::Registry,
@@ -134,6 +146,17 @@ impl App {
                 log::info!("session {existing} re-provisioning; dropping old transport");
                 self.drop_session(&existing).await;
             }
+        }
+
+        // Refuse politely rather than exhausting ports or CPU. The viewer treats a
+        // failed provision as retryable, so this degrades to "voice unavailable"
+        // instead of taking the service down for everyone already connected.
+        if self.sessions.session_count() >= MAX_SESSIONS {
+            log::warn!(
+                "refusing provision: at the {MAX_SESSIONS}-session ceiling (agent {})",
+                params.user_id
+            );
+            return Err("voice service is at capacity".into());
         }
 
         // Identity comes from the REGION (params.user_id), never from the viewer's
@@ -352,8 +375,24 @@ async fn handle(app: Arc<App>, req: Request<Body>) -> Result<Response<Body>, hyp
             .unwrap());
     }
 
-    let whole = hyper::body::to_bytes(req.into_body()).await?;
-    Ok(rpc_response(app, whole).await)
+    // Bounded read. `to_bytes` would buffer the entire body with no limit, so a
+    // single large POST could drive the process into its MemoryMax and get it
+    // OOM-killed — a trivial denial of service for anyone who can reach the port.
+    // The largest legitimate body is an SDP offer plus a trickled candidate list.
+    let mut body = req.into_body();
+    let mut whole = bytes::BytesMut::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk?;
+        if whole.len() + chunk.len() > MAX_RPC_BODY {
+            log::warn!(
+                "rejecting oversize JSON-RPC body (>{} bytes) — possible abuse",
+                MAX_RPC_BODY
+            );
+            return Ok(json_200(&proto::rpc_err(&Value::Null, "request body too large")));
+        }
+        whole.extend_from_slice(&chunk);
+    }
+    Ok(rpc_response(app, whole.freeze()).await)
 }
 
 /// Always answers 200 with a JSON object.

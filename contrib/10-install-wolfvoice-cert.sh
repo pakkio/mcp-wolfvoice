@@ -15,8 +15,11 @@ set -eu
 DEST=/etc/wolfvoice/tls
 install -d -o root -g wolfvoice -m 0750 "$DEST"
 
-install -o wolfvoice -g wolfvoice -m 0644 "$RENEWED_LINEAGE/fullchain.pem" "$DEST/.fullchain.pem.new"
-install -o wolfvoice -g wolfvoice -m 0640 "$RENEWED_LINEAGE/privkey.pem"   "$DEST/.privkey.pem.new"
+# ROOT owns these; the service only reads them. That matters here because LXC's
+# container-wide systemd drop-in clears ReadOnlyPaths=, so a compromised service
+# would otherwise be able to rewrite its own TLS material.
+install -o root -g wolfvoice -m 0644 "$RENEWED_LINEAGE/fullchain.pem" "$DEST/.fullchain.pem.new"
+install -o root -g wolfvoice -m 0640 "$RENEWED_LINEAGE/privkey.pem"   "$DEST/.privkey.pem.new"
 mv -f "$DEST/.fullchain.pem.new" "$DEST/fullchain.pem"
 mv -f "$DEST/.privkey.pem.new"   "$DEST/privkey.pem"
 
