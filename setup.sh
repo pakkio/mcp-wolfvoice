@@ -93,7 +93,7 @@ if [ -n "$resolved" ] && [ "$resolved" != "$public_ip" ]; then
 fi
 
 # ── download ──────────────────────────────────────────────────────────────────
-step "Downloading $asset"
+step "Downloading"
 command -v curl >/dev/null || die "curl is required"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
