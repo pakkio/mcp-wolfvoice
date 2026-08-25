@@ -10,7 +10,7 @@ symptom is silence with nothing obvious in the logs.
 ## 1. The addon
 
 wolfvoice does not talk to OpenSim directly. It relies on
-[os-webrtc-janus](https://github.com/Misterblue/os-webrtc-janus) for the region-side
+[os-webrtc-janus](https://github.com/wolfsoftwaresystemsltd/os-webrtc-janus) for the region-side
 half: registering the `ProvisionVoiceAccountRequest`, `VoiceSignalingRequest` and
 `ParcelVoiceInfoRequest` capabilities, advertising `VoiceServerType = webrtc` to the
 viewer, and forwarding those capability calls onward as JSON-RPC.
@@ -28,9 +28,15 @@ channel and mixes per listener instead.
 
 Build it in the normal way:
 
+> **Clone the Wolf fork, and the fixed branch.** Upstream `Misterblue/os-webrtc-janus`
+> is archived by its author, and this fork's `main` is byte-identical to it — so a plain
+> `git clone` of either gives you the same broken build. The fix lives on the branch below:
+> `ChatSessionRequest` used to invent a P2P session id, which broke Firestorm text IMs
+> grid-wide whenever WebRTC voice was enabled.
+
 ```bash
 cd opensim/addon-modules
-git clone https://github.com/Misterblue/os-webrtc-janus.git
+git clone -b chatsession-p2p-session-id-and-fast-fail https://github.com/wolfsoftwaresystemsltd/os-webrtc-janus.git os-webrtc-janus
 cd ..
 ./runprebuild.sh && ./compile.sh     # or dotnet build
 ```
@@ -164,7 +170,7 @@ so leaving that value empty is fine.
 ### If you are on an older addon build
 
 This is fixed upstream in
-[os-webrtc-janus](https://github.com/Misterblue/os-webrtc-janus), which handles
+[os-webrtc-janus](https://github.com/wolfsoftwaresystemsltd/os-webrtc-janus), which handles
 `start p2p voice` by recomputing the P2P session id and replying via
 `IEventQueue.ChatterBoxSessionStartReply`. **Update the addon if you can.**
 

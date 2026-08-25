@@ -253,6 +253,15 @@ cat <<EOF
       WebRtcVoice.dll and the region-side capabilities. You do not need to run a
       Janus gateway alongside it. Then restart the region.
 
+      GET IT FROM THE WOLF FORK, AND THE FIXED BRANCH:
+          git clone -b chatsession-p2p-session-id-and-fast-fail \
+              https://github.com/wolfsoftwaresystemsltd/os-webrtc-janus.git \
+              os-webrtc-janus
+      Upstream is archived by its author and the fork's main is identical to it,
+      so a plain clone of either builds the BROKEN version: ChatSessionRequest
+      invents a P2P session id, which breaks Firestorm text IMs grid-wide as soon
+      as WebRTC voice is switched on.
+
    b) ALLOW VOICE ON THE ESTATE AND THE PARCEL.
           About Land -> Sound -> Allow Voice Chat
       This is the most common reason for "it does nothing": with voice disallowed
