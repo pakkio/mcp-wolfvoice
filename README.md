@@ -91,19 +91,75 @@ binary, creates an unprivileged service user, obtains a TLS certificate with cer
 
 ### 2. Build os-webrtc-janus into OpenSim
 
-> **Clone the Wolf fork, and the fixed branch.** Upstream `Misterblue/os-webrtc-janus`
-> is archived by its author, and this fork's `main` is byte-identical to it — so a plain
-> `git clone` of either gives you the same broken build. The fix lives on the branch below:
-> `ChatSessionRequest` used to invent a P2P session id, which broke Firestorm text IMs
-> grid-wide whenever WebRTC voice was enabled.
+**First, check whether your OpenSim already ships it.** Since 26 Feb 2026 the addon
+is integrated into both upstream OpenSimulator and OpenSim-NGC — if either directory
+below exists, **do not clone anything** (a second copy in `addon-modules/` breaks the
+build with duplicate project names). Just build OpenSim the way you normally do and
+skip to step 3:
+
+```bash
+ls OpenSim/Addons/os-webrtc-janus 2>/dev/null   # upstream master
+ls Addons/os-webrtc-janus         2>/dev/null   # OpenSim-NGC
+```
+
+On an **older tree** without it, clone the Wolf fork's fixed branch (upstream
+`Misterblue/os-webrtc-janus` is archived, and its `main` still has the
+`ChatSessionRequest` bug that broke Firestorm text IMs grid-wide whenever WebRTC
+voice was enabled):
 
 ```bash
 cd opensim/addon-modules
 git clone -b chatsession-p2p-session-id-and-fast-fail https://github.com/wolfsoftwaresystemsltd/os-webrtc-janus.git os-webrtc-janus
-cd .. && ./runprebuild.sh && ./compile.sh      # or: dotnet build
+cd ..
 ```
 
-You want `WebRtcVoice.dll` and `WebRtcVoiceServiceModule.dll` in `bin/`.
+Then build. **Which build you have is told by the tree itself:**
+
+**A. Classic tree — `runprebuild.sh` exists at the OpenSim root**
+(opensimulator.org 0.9.2.x / early 0.9.3):
+
+```bash
+./runprebuild.sh    # also (re)generates compile.sh — it's normal for it to be missing before this
+./compile.sh        # or: dotnet build -c Release OpenSim.sln
+```
+
+Prebuild picks the module up automatically and the DLLs land directly in `bin/`.
+
+**B. dotnet-era tree — no `runprebuild.sh`, but `OpenSim.sln` and
+`Directory.Build.props` at the root** (OpenSim-NGC snapshots; "the only .sh in the
+tree is the addon's own updateVersion.sh" means you are here). Prebuild is gone and
+the solution only builds projects registered in it, so register the module's four
+projects once, then build:
+
+```bash
+dotnet sln OpenSim.sln add \
+    addon-modules/os-webrtc-janus/WebRtcVoice/WebRtcVoice.csproj \
+    addon-modules/os-webrtc-janus/WebRtcVoiceServiceModule/WebRtcVoiceServiceModule.csproj \
+    addon-modules/os-webrtc-janus/WebRtcVoiceRegionModule/WebRtcVoiceRegionModule.csproj \
+    addon-modules/os-webrtc-janus/Janus/WebRtcJanusService.csproj
+dotnet build --configuration Release OpenSim.sln
+```
+
+Build via the solution, not the individual csproj files — the tree's
+`Directory.Build.props` computes output paths from the solution directory. Output
+goes to `build/Release/<AssemblyName>/`, **not** `bin/`; copy the DLLs into the
+`bin/` your regions actually run from:
+
+```bash
+cp build/Release/WebRtcVoice/WebRtcVoice.dll \
+   build/Release/WebRtcVoiceServiceModule/WebRtcVoiceServiceModule.dll \
+   build/Release/WebRtcVoiceRegionModule/WebRtcVoiceRegionModule.dll  /path/to/runtime/bin/
+```
+
+**C. Binary-only distribution** (no `OpenSim.sln`, no source directories — just
+`bin/`): you cannot build the addon there. Build it inside a source tree of the
+**exact same OpenSim version** using A or B, then copy the three `WebRtc*.dll`
+files into the distribution's `bin/`. Mismatched versions will fail to load.
+
+Whichever route: you need `WebRtcVoice.dll`, `WebRtcVoiceServiceModule.dll` and
+`WebRtcVoiceRegionModule.dll` in the runtime `bin/` (the also-built
+`WebRtcJanusService.dll` is simply unused when pointing at wolfvoice). The modules
+load at startup — **restart the region** after copying.
 
 ### 3. Configure each region
 

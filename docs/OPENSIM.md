@@ -26,24 +26,56 @@ of Linden Lab's protocol that ride the data channel (position, per-user gain, mu
 the speaker roster) therefore have nowhere to travel. wolfvoice terminates that
 channel and mixes per listener instead.
 
-Build it in the normal way:
+**First check whether your OpenSim already ships it.** Since 26 Feb 2026 the addon is
+integrated into both upstream OpenSimulator (`OpenSim/Addons/os-webrtc-janus/`) and
+OpenSim-NGC (`Addons/os-webrtc-janus/`). If either directory exists, **do not clone
+anything** — a second copy in `addon-modules/` breaks the build with duplicate project
+names. Just build OpenSim as you normally do and skip to region configuration.
 
-> **Clone the Wolf fork, and the fixed branch.** Upstream `Misterblue/os-webrtc-janus`
-> is archived by its author, and this fork's `main` is byte-identical to it — so a plain
-> `git clone` of either gives you the same broken build. The fix lives on the branch below:
-> `ChatSessionRequest` used to invent a P2P session id, which broke Firestorm text IMs
-> grid-wide whenever WebRTC voice was enabled.
+On an **older tree** without it, clone the Wolf fork's fixed branch (upstream
+`Misterblue/os-webrtc-janus` is archived; its `main` still invents a P2P session id in
+`ChatSessionRequest`, which broke Firestorm text IMs grid-wide whenever WebRTC voice
+was enabled):
 
 ```bash
 cd opensim/addon-modules
 git clone -b chatsession-p2p-session-id-and-fast-fail https://github.com/wolfsoftwaresystemsltd/os-webrtc-janus.git os-webrtc-janus
 cd ..
-./runprebuild.sh && ./compile.sh     # or dotnet build
 ```
 
-You end up with `WebRtcVoice.dll`, `WebRtcVoiceServiceModule.dll` and
-`WebRtcVoiceRegionModule.dll` in `bin/` — all three are needed. `WebRtcJanusService.dll`
-is also built, and is simply unused when you point the connector at wolfvoice.
+Then build — which build you have is told by the tree itself:
+
+**Classic tree** (`runprebuild.sh` exists at the OpenSim root):
+
+```bash
+./runprebuild.sh    # also (re)generates compile.sh — normal for it to be missing before this
+./compile.sh        # or: dotnet build -c Release OpenSim.sln
+```
+
+The DLLs land directly in `bin/`.
+
+**dotnet-era tree** (no `runprebuild.sh`; `OpenSim.sln` + `Directory.Build.props` at
+the root — "the only .sh is the addon's own updateVersion.sh" means you are here).
+Prebuild is gone and the solution only builds registered projects, so register the
+module once, then build via the solution:
+
+```bash
+dotnet sln OpenSim.sln add \
+    addon-modules/os-webrtc-janus/WebRtcVoice/WebRtcVoice.csproj \
+    addon-modules/os-webrtc-janus/WebRtcVoiceServiceModule/WebRtcVoiceServiceModule.csproj \
+    addon-modules/os-webrtc-janus/WebRtcVoiceRegionModule/WebRtcVoiceRegionModule.csproj \
+    addon-modules/os-webrtc-janus/Janus/WebRtcJanusService.csproj
+dotnet build --configuration Release OpenSim.sln
+```
+
+Output goes to `build/Release/<AssemblyName>/`, **not** `bin/` — copy
+`WebRtcVoice.dll`, `WebRtcVoiceServiceModule.dll` and `WebRtcVoiceRegionModule.dll`
+into the `bin/` your regions run from, then restart the region.
+
+All three DLLs are needed. `WebRtcJanusService.dll` is also built, and is simply
+unused when you point the connector at wolfvoice. (A binary-only distribution with no
+source tree cannot build the addon — build in a source tree of the exact same OpenSim
+version and copy the DLLs in.)
 
 Check what you actually have deployed rather than trusting the build:
 
@@ -169,10 +201,12 @@ so leaving that value empty is fine.
 
 ### If you are on an older addon build
 
-This is fixed upstream in
-[os-webrtc-janus](https://github.com/wolfsoftwaresystemsltd/os-webrtc-janus), which handles
-`start p2p voice` by recomputing the P2P session id and replying via
-`IEventQueue.ChatterBoxSessionStartReply`. **Update the addon if you can.**
+This is fixed in the
+[Wolf fork branch](https://github.com/wolfsoftwaresystemsltd/os-webrtc-janus) and in the
+copies integrated into OpenSimulator core and OpenSim-NGC since 26 Feb 2026 — those
+handle `start p2p voice` by recomputing the P2P session id (XOR of the two agent ids)
+and replying via `IEventQueue.ChatterBoxSessionStartReply`. **Update the addon (or
+OpenSim itself) if you can.**
 
 Check first whether you actually can: current upstream uses API that older OpenSim trees
 do not have (`OSDMap.TryGetUUID` / `TryGetString`, `UUID.ulonga`/`ulongb`). If your
