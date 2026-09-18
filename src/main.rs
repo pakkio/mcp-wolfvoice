@@ -8,6 +8,7 @@
 //! Because both Firestorm and WolfStorm reach us through the same region
 //! capability, they land in the same rooms with the same spatialisation.
 
+mod logctl;
 mod mixer;
 mod proto;
 mod room;
@@ -54,6 +55,13 @@ const MEDIA_PORT_HI: u16 = 40999;
 
 const TLS_CERT: &str = "/etc/wolfvoice/tls/fullchain.pem";
 const TLS_KEY: &str = "/etc/wolfvoice/tls/privkey.pem";
+
+/// Loopback-only admin control (log level, mic-log scope): plain HTTP, no TLS,
+/// bound to 127.0.0.1 so it is unreachable from anywhere the public :9443
+/// signalling port is (region hosts, the internet). wolfvoice-mcp is the only
+/// intended client, reaching it over loopback the same way it already reaches
+/// the :9443 health check.
+const ADMIN_BIND: &str = "127.0.0.1:9444";
 
 /// Mixer cadence. One Opus frame per tick per listener.
 const TICK: Duration = Duration::from_millis(20);
@@ -319,7 +327,7 @@ async fn mixer_loop(app: Arc<App>) {
                     while let Some(f) = m.take_frame() {
                         last = Some(f);
                     }
-                    m.update_level(last.as_deref());
+                    m.update_level(last.as_deref(), false);
                 }
                 continue;
             }
@@ -358,6 +366,97 @@ async fn mixer_loop(app: Arc<App>) {
                 inflight.fetch_sub(1, Ordering::AcqRel);
             });
         }
+    }
+}
+
+// ─────────────────────────── admin (loopback only) ───────────────────────────
+
+async fn admin_handle(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
+    fn json_body(status: StatusCode, v: Value) -> Response<Body> {
+        Response::builder()
+            .status(status)
+            .header("content-type", "application/json")
+            .body(Body::from(v.to_string()))
+            .unwrap()
+    }
+
+    fn status_json() -> Value {
+        json!({"log_level": logctl::get_level(), "mic_log_mode": logctl::get_mic_mode()})
+    }
+
+    let (method, path) = (req.method().clone(), req.uri().path().to_string());
+
+    if method == Method::GET && path == "/status" {
+        return Ok(json_body(StatusCode::OK, status_json()));
+    }
+
+    if method != Method::POST || (path != "/log-level" && path != "/mic-log-mode") {
+        return Ok(json_body(StatusCode::NOT_FOUND, json!({"error": "not found"})));
+    }
+
+    let mut body = req.into_body();
+    let mut whole = bytes::BytesMut::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk?;
+        if whole.len() + chunk.len() > 4096 {
+            return Ok(json_body(StatusCode::PAYLOAD_TOO_LARGE, json!({"error": "body too large"})));
+        }
+        whole.extend_from_slice(&chunk);
+    }
+    let parsed: Result<Value, _> = serde_json::from_slice(&whole);
+    let field = if path == "/log-level" { "level" } else { "mode" };
+    let value = match &parsed {
+        Ok(v) => v.get(field).and_then(Value::as_str),
+        Err(_) => None,
+    };
+    let Some(value) = value else {
+        return Ok(json_body(
+            StatusCode::BAD_REQUEST,
+            json!({"error": format!("expected JSON body {{\"{field}\": \"...\"}}")}),
+        ));
+    };
+
+    let result = if path == "/log-level" { logctl::set_level(value) } else { logctl::set_mic_mode(value) };
+    match result {
+        Ok(_) => Ok(json_body(StatusCode::OK, status_json())),
+        Err(e) => Ok(json_body(StatusCode::BAD_REQUEST, json!({"error": e}))),
+    }
+}
+
+/// Serves `admin_handle` on `ADMIN_BIND`. Bound to loopback by address alone, but
+/// the accept loop also drops any connection whose peer is not 127.0.0.1/::1 —
+/// belt and braces against a future bind-address typo turning this into a
+/// remotely reachable log-level/mic-log-mode toggle.
+async fn admin_loop() {
+    let listener = match tokio::net::TcpListener::bind(ADMIN_BIND).await {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!("admin listener failed to bind {ADMIN_BIND}: {e}");
+            return;
+        }
+    };
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("admin accept: {e}");
+                continue;
+            }
+        };
+        if !peer.ip().is_loopback() {
+            log::warn!("admin: rejecting non-loopback peer {peer}");
+            continue;
+        }
+        tokio::spawn(async move {
+            let svc = service_fn(admin_handle);
+            if let Err(e) = hyper::server::conn::Http::new()
+                .http1_only(true)
+                .serve_connection(stream, svc)
+                .await
+            {
+                log::debug!("admin connection from {peer}: {e}");
+            }
+        });
     }
 }
 
@@ -494,7 +593,7 @@ fn load_tls() -> Result<rustls::ServerConfig, String> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    logctl::init();
 
     // Fail loudly rather than guessing: a wrong public address produces a service
     // that answers every request and then never connects, which is a miserable
@@ -521,6 +620,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     tokio::spawn(mixer_loop(app.clone()));
+    tokio::spawn(admin_loop());
 
     let tls = Arc::new(load_tls()?);
     let acceptor = tokio_rustls::TlsAcceptor::from(tls);

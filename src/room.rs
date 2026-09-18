@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
+use crate::logctl;
 use crate::mixer::{self, FRAME_SAMPLES};
 use crate::proto::{self, RosterEntry};
 
@@ -112,16 +113,18 @@ impl Session {
 
     /// Update this session's speech level from an optional decoded frame
     /// (`None` means silence, e.g. no frame arrived this tick), and log a
-    /// mic-activity line on silence<->speech transitions. Shared by
-    /// `mix_room` and the lone-participant drain path in `main.rs`, since a
-    /// solo speaker (no one to mix for) still needs its level tracked.
-    pub fn update_level(&self, frame: Option<&[f32]>) -> u8 {
+    /// mic-activity line on silence<->speech transitions, subject to
+    /// `logctl::mic_log_allowed`. `mixed` is whether the room had another
+    /// participant at this tick — shared by `mix_room` (`mixed = true`) and
+    /// the lone-participant drain path in `main.rs` (`mixed = false`), since
+    /// a solo speaker (no one to mix for) still needs its level tracked.
+    pub fn update_level(&self, frame: Option<&[f32]>, mixed: bool) -> u8 {
         let level = frame.map(mixer::level_to_wire).unwrap_or(0);
         self.level.store(level, Ordering::Relaxed);
 
         let speaking = (level as f32 / proto::LEVEL_SCALE_TO_WIRE) > proto::SPEAKING_AUDIO_LEVEL;
         let was_speaking = self.was_speaking.swap(speaking, Ordering::Relaxed);
-        if speaking != was_speaking {
+        if speaking != was_speaking && logctl::mic_log_allowed(mixed) {
             if speaking {
                 log::info!(
                     "mic activity: session {} agent {} started speaking (level {level})",
@@ -313,7 +316,7 @@ pub fn mix_room(members: &[Arc<Session>]) -> Vec<ListenerOutput> {
     let mut frames: Vec<(Arc<Session>, Option<Vec<f32>>)> = Vec::with_capacity(members.len());
     for m in members {
         let f = m.take_frame();
-        m.update_level(f.as_deref());
+        m.update_level(f.as_deref(), true);
         frames.push((m.clone(), f));
     }
 
