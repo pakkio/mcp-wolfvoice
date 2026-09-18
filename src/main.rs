@@ -311,10 +311,15 @@ async fn mixer_loop(app: Arc<App>) {
             let members = app.sessions.members(&key);
             if members.len() < 2 {
                 // Nobody to mix for. Still drain the jitter buffers so a lone
-                // participant's audio does not pile up until someone joins.
+                // participant's audio does not pile up until someone joins,
+                // and still track/log their speech level off the most recent
+                // frame, so a solo mic check has something to show for it.
                 for m in &members {
-                    while m.take_frame().is_some() {}
-                    m.level.store(0, Ordering::Relaxed);
+                    let mut last = None;
+                    while let Some(f) = m.take_frame() {
+                        last = Some(f);
+                    }
+                    m.update_level(last.as_deref());
                 }
                 continue;
             }

@@ -81,6 +81,10 @@ pub struct Session {
     pub joined: AtomicBool,
     pub primary: AtomicBool,
     pub closed: AtomicBool,
+    /// Tracks whether the last tick's RMS level cleared the speaking threshold,
+    /// so we log a mic-activity line only on silence<->speech transitions
+    /// instead of once per 20 ms tick.
+    was_speaking: AtomicBool,
 
     /// Agents we have already announced to this listener, so a join is sent once.
     announced: Mutex<HashSet<String>>,
@@ -101,8 +105,38 @@ impl Session {
             joined: AtomicBool::new(false),
             primary: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            was_speaking: AtomicBool::new(false),
             announced: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Update this session's speech level from an optional decoded frame
+    /// (`None` means silence, e.g. no frame arrived this tick), and log a
+    /// mic-activity line on silence<->speech transitions. Shared by
+    /// `mix_room` and the lone-participant drain path in `main.rs`, since a
+    /// solo speaker (no one to mix for) still needs its level tracked.
+    pub fn update_level(&self, frame: Option<&[f32]>) -> u8 {
+        let level = frame.map(mixer::level_to_wire).unwrap_or(0);
+        self.level.store(level, Ordering::Relaxed);
+
+        let speaking = (level as f32 / proto::LEVEL_SCALE_TO_WIRE) > proto::SPEAKING_AUDIO_LEVEL;
+        let was_speaking = self.was_speaking.swap(speaking, Ordering::Relaxed);
+        if speaking != was_speaking {
+            if speaking {
+                log::info!(
+                    "mic activity: session {} agent {} started speaking (level {level})",
+                    self.id,
+                    self.agent_id
+                );
+            } else {
+                log::info!(
+                    "mic activity: session {} agent {} stopped speaking",
+                    self.id,
+                    self.agent_id
+                );
+            }
+        }
+        level
     }
 
     /// Push one decoded frame, dropping the oldest if the listener is not keeping up.
@@ -279,11 +313,7 @@ pub fn mix_room(members: &[Arc<Session>]) -> Vec<ListenerOutput> {
     let mut frames: Vec<(Arc<Session>, Option<Vec<f32>>)> = Vec::with_capacity(members.len());
     for m in members {
         let f = m.take_frame();
-        if let Some(ref frame) = f {
-            m.level.store(mixer::level_to_wire(frame), Ordering::Relaxed);
-        } else {
-            m.level.store(0, Ordering::Relaxed);
-        }
+        m.update_level(f.as_deref());
         frames.push((m.clone(), f));
     }
 
